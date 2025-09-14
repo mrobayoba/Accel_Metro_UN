@@ -1,6 +1,15 @@
+# Dev files
+/Release/
+/Debug/
+.elf
+
 # Launch files
+.launch
 
 # Libraries
+/Drivers/
+/FATFS/
+/Middlewares/
 
 # Other files
 .pdf
