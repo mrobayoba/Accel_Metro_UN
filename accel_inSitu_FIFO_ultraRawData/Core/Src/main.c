@@ -52,6 +52,10 @@
 #define TAG_SENSOR_TIMESTAMP 0x04
 #define WTM_THRESHOLD 20 // 50 FIFO words use only even numbers between 0 and 511
 
+#define IIS3DWB_ODR_HZ        26667U
+#define TARGET_LOG_HZ         1000U   // <-- change this to the frequency you want in the TXT
+#define DECIM_N   ((TARGET_LOG_HZ==0U)?1U:((IIS3DWB_ODR_HZ + (TARGET_LOG_HZ/2U))/TARGET_LOG_HZ))
+
 #define TRUE 1
 #define FALSE 0
 
@@ -631,14 +635,35 @@ void iis_FIFO_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 }
 
 void dataBuffering(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
-		uint32_t *ptrTimestamp, char *ptrBuffer, char *ptrStrData) {
-	//after read and reconstruct data, buffer all the data to write it into SD card
-	for (uint16_t i = 0; i < WTM_THRESHOLD / 2; i++) {
+        uint32_t *ptrTimestamp, char *ptrBuffer, char *ptrStrData) {
+    // After read and reconstruct data, buffer all the data to write it into SD card.
+    // Note: ptrTimestamp is in "ticks" (12.5 us per LSB). We convert to real microseconds here.
+    // Also: we decimate the logged samples to TARGET_LOG_HZ (effective rate in the TXT).
+    static uint32_t sample_idx = 0;
+    const uint32_t n = (DECIM_N < 1U) ? 1U : DECIM_N;
 
-		sprintf(ptrBuffer, "%lu %d %d %d \n", *ptrTimestamp, *ptrDataX,
-				*ptrDataY, *ptrDataZ);
-		strcat(ptrStrData, ptrBuffer);
-		clear_buffer();
+    for (uint16_t i = 0; i < WTM_THRESHOLD / 2; i++) {
+
+        // Always advance the global sample index, even if we don't log this sample.
+        uint32_t idx = sample_idx++;
+        if ((idx % n) != 0U) {
+            ptrDataX++;
+            ptrDataY++;
+            ptrDataZ++;
+            ptrTimestamp++;
+            continue;
+        }
+
+        // Convert timestamp ticks -> real microseconds.
+        // 12.5 us/LSB = 125 tenths of us per tick.
+        uint64_t t_us_x10 = (uint64_t)(*ptrTimestamp) * 125ULL;
+        unsigned long long t_us = (unsigned long long)(t_us_x10 / 10ULL);
+        unsigned long long t_us_frac = (unsigned long long)(t_us_x10 % 10ULL);
+
+        sprintf(ptrBuffer, "%llu.%1llu %d %d %d \n",
+                t_us, t_us_frac, *ptrDataX, *ptrDataY, *ptrDataZ);
+        strcat(ptrStrData, ptrBuffer);
+        clear_buffer();
 
 		ptrDataX++;
 		ptrDataY++;
@@ -646,6 +671,7 @@ void dataBuffering(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 		ptrTimestamp++;
 	}
 }
+
 
 void clear_string(char *string) {
 
