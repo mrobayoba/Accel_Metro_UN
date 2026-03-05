@@ -35,6 +35,7 @@
 #include "math.h"
 //#include "micros.h"
 #include <stdbool.h>
+#include <stdarg.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,9 +45,16 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define UART_DEBUG_ENABLE 0   // Handcoded: set to 1 to enable UART logs, 0 to compile out debug logs
+
 #define BUFFER_SIZE 72
 #define DATA_BUFFERSIZE 20*7 // 7 bytes per word * 20 words
 #define BUFFER_DATA_SIZE 10000
+
+#define LOG_CHUNK_SIZE       4096U
+#define LOG_LINE_MAX         64U
+#define SYNC_BYTES_THRESHOLD (256U * 1024U)
+#define SPI_DMA_TIMEOUT_MS   20U
 
 #define TAG_SENSOR_ACCEL 0x02
 #define TAG_SENSOR_TIMESTAMP 0x04
@@ -119,14 +127,19 @@ double ang_x_prev, ang_y, ang_y_prev, ang_x, angx, angy, angz;
 double VgirosX, VgirosY, VgirosXcum, VgirosYcum;
 
 uint32_t dt, timePrev;
-uint16_t time_counter_done = RESET; // threshold time flag
+volatile uint16_t time_counter_done = RESET; // threshold time flag
 // banderas de las interrupciones
-uint8_t flag_recordData = RESET; // acquire and record flag
-uint8_t flag_toggleRecord = RESET; // start/stop recording flag
-uint8_t flag_openFile = RESET; // open file flag
-uint8_t flag_closeFile = RESET; // close file flag
+volatile uint8_t flag_recordData = RESET; // acquire and record flag
+volatile uint8_t flag_toggleRecord = RESET; // start/stop recording flag
+volatile uint8_t flag_openFile = RESET; // open file flag
+volatile uint8_t flag_closeFile = RESET; // close file flag
 uint8_t flag_dataAvailable = RESET; // SETs by read the status register XLDA bit
 uint8_t flag_FIFO_dataAvailable = RESET; // SETs by read FIFO_WTM_IA flag on FIFO_status register 2
+
+volatile uint8_t flag_fifo_irq = RESET;
+
+volatile uint8_t spi_fifo_dma_done = RESET;
+volatile uint8_t spi_fifo_dma_error = RESET;
 
 // estructuras y variables para el manejo de la sd
 FATFS myFatFS;
@@ -146,7 +159,17 @@ char myFileName[15] = "record_1.txt";
 int data_b[1];
 int i = 0;
 
+// Double-buffered log writing
+char log_buf_a[LOG_CHUNK_SIZE] = {0};
+char log_buf_b[LOG_CHUNK_SIZE] = {0};
+char *active_log_buf = log_buf_a;
+char *flush_log_buf  = log_buf_b;
+uint32_t active_log_len = 0U;
+uint32_t flush_log_len = 0U;
+volatile uint8_t flush_pending = RESET;
 
+uint32_t bytes_since_sync = 0U;
+uint32_t dropped_lines = 0U;
 
 /* Decimation counter: applied per raw accel sample inside FIFO read */
 uint8_t decim_counter = 0;
@@ -165,6 +188,15 @@ void SystemClock_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 void clear_buffer(void);
+
+// Debug wrapper functions
+void dbg_uart(const char *msg);
+void dbg_uartf(const char *fmt, ...);
+
+// Buffering and flushing
+HAL_StatusTypeDef iis_read_fifo_dma(uint8_t reg, uint8_t *dst, uint16_t len);
+FRESULT flush_chunk(char *buf, uint32_t len);
+FRESULT flush_pending_buffers(void);
 
 //funciones del acelerometro
 void iis_write(uint8_t address, uint8_t value);
@@ -365,6 +397,14 @@ int main(void)
 			send_uart2("\n");
 			clear_buffer();
 
+			// Flush remaining data before closing
+			if (flush_pending_buffers() != FR_OK) {
+				dbg_uart("Final flush failed\n");
+			}
+			if (f_sync(&myFile) != FR_OK) {
+				dbg_uart("Final f_sync failed\n");
+			}
+
 			f_close(&myFile);
 
 			// Disable accelerometer after finish data recording
@@ -384,25 +424,64 @@ int main(void)
 		}
 
 		if (flag_recordData) {
-			uint32_t aux = 0;
-
-			iis_FIFO_read(datax, datay, dataz, time);
+			if (flag_fifo_irq) {
+				flag_fifo_irq = RESET;
+				iis_FIFO_read(datax, datay, dataz, time);
+			}
 
 			for (uint16_t i = 0; i < WTM_THRESHOLD / 2; i++) {
 				if (time[i] == 0) continue; // slot vacío
 				// Solo guardar si han pasado >= 80 LSB (80 x 12.5us = 1ms) desde la última guardada
 				if (last_saved_ts != 0 && time[i] < last_saved_ts + TS_THRESHOLD) continue;
 				last_saved_ts = time[i];
+				
+				char line[LOG_LINE_MAX];
 				float ts_ms = (float)time[i] * 12.5f / 1000.0f;
-				sprintf(buffer, "%.3f %d %d %d\n", ts_ms, datax[i], datay[i], dataz[i]);
-				f_write(&myFile, buffer, strlen(buffer), (UINT*) &aux);
-				clear_buffer();
+				int line_len = snprintf(line, sizeof(line), "%.3f %d %d %d\n", ts_ms, datax[i], datay[i], dataz[i]);
+
+				if (line_len > 0 && (uint32_t)line_len < LOG_LINE_MAX) {
+					if ((active_log_len + (uint32_t)line_len) > LOG_CHUNK_SIZE) {
+						if (flush_pending == SET) {
+							dropped_lines++;
+						} else {
+							char *tmp = flush_log_buf;
+							flush_log_buf = active_log_buf;
+							flush_log_len = active_log_len;
+							active_log_buf = tmp;
+							active_log_len = 0U;
+							flush_pending = SET;
+						}
+					}
+
+					if ((active_log_len + (uint32_t)line_len) <= LOG_CHUNK_SIZE) {
+						memcpy(&active_log_buf[active_log_len], line, (size_t)line_len);
+						active_log_len += (uint32_t)line_len;
+					} else {
+						dropped_lines++;
+					}
+				}
 			}
 
-			if (time_counter_done) { // to secure recorded data each 30min
+			if (flush_pending == SET) {
+				if (flush_pending_buffers() != FR_OK) {
+					flag_recordData = RESET;
+					flag_toggleRecord = RESET;
+					flag_closeFile = SET;
+				}
+			}
+
+			if (bytes_since_sync >= SYNC_BYTES_THRESHOLD || time_counter_done) {
 				time_counter_done = RESET;
-				f_sync(&myFile); // To flush cached data
-				send_uart2("Se han guardado 30min de datos\n");
+				if (f_sync(&myFile) != FR_OK) {
+					HAL_GPIO_WritePin(ERROR_LED_PORT, ERROR_LED_PIN, TRUE);
+					dbg_uart("f_sync failed\n");
+					flag_recordData = RESET;
+					flag_toggleRecord = RESET;
+					flag_closeFile = SET;
+				} else {
+					bytes_since_sync = 0U;
+					dbg_uart("Periodic sync OK\n");
+				}
 			}
 		}
 	}
@@ -472,8 +551,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 			__NOP();
 		}
 	}
-	if (GPIO_Pin == GPIO_PIN_9) { // Accel_pin
-		iis_FIFO_read(datax, datay, dataz, time); // to read data from the FIFO
+	if (GPIO_Pin == GPIO_PIN_9) { // Accel FIFO watermark IRQ
+		flag_fifo_irq = SET;
 	}
 }
 
@@ -503,6 +582,71 @@ void clear_buffer(void) {
 	for (int i = 0; i < BUFFER_SIZE; i++) {
 		buffer[i] = '\0';
 	}
+}
+
+// Debug wrapper functions (compile-time gated)
+void dbg_uart(const char *msg) {
+#if UART_DEBUG_ENABLE
+	if (devMode && msg != NULL) {
+		HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+	}
+#else
+	(void)msg;
+#endif
+}
+
+void dbg_uartf(const char *fmt, ...) {
+#if UART_DEBUG_ENABLE
+	if (!devMode || fmt == NULL) return;
+
+	char dbg[128];
+	va_list args;
+	va_start(args, fmt);
+	int n = vsnprintf(dbg, sizeof(dbg), fmt, args);
+	va_end(args);
+
+	if (n > 0) {
+		uint16_t len = (n >= (int)sizeof(dbg)) ? (uint16_t)(sizeof(dbg) - 1U) : (uint16_t)n;
+		HAL_UART_Transmit(&huart2, (uint8_t *)dbg, len, HAL_MAX_DELAY);
+	}
+#else
+	(void)fmt;
+#endif
+}
+
+// Buffered flush functions
+FRESULT flush_chunk(char *buf, uint32_t len) {
+	if (len == 0U) return FR_OK;
+
+	UINT written = 0U;
+	FRESULT fr = f_write(&myFile, buf, len, &written);
+	if (fr != FR_OK || written != len) {
+		HAL_GPIO_WritePin(ERROR_LED_PORT, ERROR_LED_PIN, TRUE);
+		dbg_uartf("f_write error fr=%d written=%lu expected=%lu\n", (int)fr, (uint32_t)written, len);
+		return (fr == FR_OK) ? FR_DISK_ERR : fr;
+	}
+
+	bytes_since_sync += len;
+	return FR_OK;
+}
+
+FRESULT flush_pending_buffers(void) {
+	FRESULT fr = FR_OK;
+
+	if (flush_pending == SET) {
+		fr = flush_chunk(flush_log_buf, flush_log_len);
+		flush_pending = RESET;
+		flush_log_len = 0U;
+		if (fr != FR_OK) return fr;
+	}
+
+	if (active_log_len > 0U) {
+		fr = flush_chunk(active_log_buf, active_log_len);
+		active_log_len = 0U;
+		if (fr != FR_OK) return fr;
+	}
+
+	return FR_OK;
 }
 
 //funciones del acelerometro
@@ -587,7 +731,11 @@ void iis_FIFO_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 	}
 	flag_FIFO_dataAvailable = RESET;
 
-	iis_read(0x78, WTM_THRESHOLD * 7, dataFIFO);
+	if (iis_read_fifo_dma(0x78, dataFIFO, WTM_THRESHOLD * 7) != HAL_OK) {
+		HAL_GPIO_WritePin(ERROR_LED_PORT, ERROR_LED_PIN, TRUE);
+		dbg_uart("SPI FIFO DMA read failed\n");
+		return;
+	}
 
 	int16_t  temp_x = 0, temp_y = 0, temp_z = 0;
 	uint32_t temp_ts = 0;
@@ -657,6 +805,55 @@ void send_uart2(char *string) {
 	}
 	uint16_t len = strlen(string);
 	HAL_UART_Transmit(&huart2, (uint8_t*) string, len, HAL_MAX_DELAY);
+}
+
+// SPI DMA callbacks for FIFO burst read
+void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi) {
+	if (hspi->Instance == SPI1) {
+		spi_fifo_dma_done = SET;
+	}
+}
+
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi) {
+	if (hspi->Instance == SPI1) {
+		spi_fifo_dma_error = SET;
+	}
+}
+
+// DMA-assisted FIFO burst read
+HAL_StatusTypeDef iis_read_fifo_dma(uint8_t reg, uint8_t *dst, uint16_t len) {
+	uint8_t address = (reg & 0x7F) | 0x80;
+
+	spi_fifo_dma_done = RESET;
+	spi_fifo_dma_error = RESET;
+
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+
+	if (HAL_SPI_Transmit(&hspi1, &address, 1, 10) != HAL_OK) {
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+		return HAL_ERROR;
+	}
+
+	if (HAL_SPI_Receive_DMA(&hspi1, dst, len) != HAL_OK) {
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+		return HAL_ERROR;
+	}
+
+	uint32_t t0 = HAL_GetTick();
+	while (spi_fifo_dma_done == RESET) {
+		if (spi_fifo_dma_error == SET) {
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+			return HAL_ERROR;
+		}
+		if ((HAL_GetTick() - t0) > SPI_DMA_TIMEOUT_MS) {
+			HAL_SPI_Abort(&hspi1);
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+			return HAL_TIMEOUT;
+		}
+	}
+
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+	return HAL_OK;
 }
 
 /* USER CODE END 4 */
