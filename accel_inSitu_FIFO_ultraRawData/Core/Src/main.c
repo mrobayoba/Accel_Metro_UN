@@ -45,16 +45,12 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define BUFFER_SIZE 72
-#define DATA_BUFFERSIZE 20*7*512 // 7bytes per word * 512 words (FIFO words) * 50 times the FIFO size
+#define DATA_BUFFERSIZE 20*7 // 7 bytes per word * 20 words
 #define BUFFER_DATA_SIZE 10000
 
 #define TAG_SENSOR_ACCEL 0x02
 #define TAG_SENSOR_TIMESTAMP 0x04
-#define WTM_THRESHOLD 20 // 50 FIFO words use only even numbers between 0 and 511
-
-#define IIS3DWB_ODR_HZ        26667U
-#define TARGET_LOG_HZ         1000U   // <-- change this to the frequency you want in the TXT
-#define DECIM_N   ((TARGET_LOG_HZ==0U)?1U:((IIS3DWB_ODR_HZ + (TARGET_LOG_HZ/2U))/TARGET_LOG_HZ))
+#define WTM_THRESHOLD 20 // 10 accel+timestamp pairs per batch
 
 #define TRUE 1
 #define FALSE 0
@@ -67,6 +63,19 @@
 
 #define BLINK_LED_PIN GPIO_PIN_1
 #define BLINK_LED_PORT GPIOC
+
+
+/* Frecuencia objetivo de muestreo - CAMBIAR ESTE VALOR SEGÚN NECESIDAD
+ * Ejemplos:
+ *   1.0f  → 1 muestra cada 1ms    (1000 Hz)
+ *   0.5f  → 1 muestra cada 0.5ms  (2000 Hz)
+ *   2.0f  → 1 muestra cada 2ms    (500  Hz)
+ *   0.1f  → 1 muestra cada 0.1ms  (10000 Hz)
+ * Mínimo posible: 0.0375ms (26667 Hz, ODR nativo del sensor)
+ */
+#define TARGET_PERIOD_MS  0.5f
+// Conversión a LSB de timestamp (1 LSB = 12.5us = 0.0125ms)
+#define TS_THRESHOLD  ((uint32_t)(TARGET_PERIOD_MS / 0.0125f))
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -137,6 +146,13 @@ char myFileName[15] = "record_1.txt";
 int data_b[1];
 int i = 0;
 
+
+
+/* Decimation counter: applied per raw accel sample inside FIFO read */
+uint8_t decim_counter = 0;
+uint32_t accumulated_samples = 0;
+uint32_t last_saved_ts = 0; // timestamp de la ultima muestra guardada (en LSB de 12.5us)
+
 int bufsize(char *buf);
 /* USER CODE END PV */
 
@@ -164,9 +180,6 @@ void iis_FIFO_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 void dataBuffering(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 		uint32_t *ptrTimestamp, char *ptrBuffer, char *ptrStrData);
 void clear_string(char *string);
-
-//void GPS_init(void);
-//void GPS_init2(void);
 
 void send_uart2(char *string);
 
@@ -211,12 +224,9 @@ int main(void)
   /* USER CODE BEGIN 2 */
 	send_uart2("Starting Accel Metro-UN\n");
 	HAL_Delay(100);
-	//	DWT_Init();
 	iis_init();
 	HAL_Delay(15);
-	//mpu_init();
 
-	//activacion INT del tmr11 por desbordamiento
 	HAL_TIM_Base_Start_IT(&htim5); // Flush timer
 	HAL_TIM_Base_Start_IT(&htim11); // Blinky timer
 	send_uart2("Ready to roll!!!");
@@ -277,12 +287,12 @@ int main(void)
 								(uint16_t) WTM_THRESHOLD);
 						f_puts(buffer, &myFile);
 						clear_buffer();
-						f_puts(
-								"Timestamp resolution = 12.5us/LSB accel resolution 0.122mg/LSB\n\n",
-								&myFile);
-						f_puts(
-								"Timestamp(us) accelX(mg) accelY(mg) accelZ(mg)\n",
-								&myFile);
+						f_puts("Timestamp resolution = 12.5us/LSB converted to ms, accel resolution 0.122mg/LSB\n", &myFile);
+						sprintf(buffer, "Target sampling period = %.4f ms (%.1f Hz)\n\n",
+								(float)TARGET_PERIOD_MS, 1000.0f / TARGET_PERIOD_MS);
+						f_puts(buffer, &myFile);
+						clear_buffer();
+						f_puts("Timestamp(ms) accelX(mg) accelY(mg) accelZ(mg)\n", &myFile);
 					}
 
 					sprintf(buffer,
@@ -294,12 +304,8 @@ int main(void)
 					send_uart2(buffer);
 					clear_buffer();
 
-					//Enable accelerometer just before start measuring
-
-					//	iis_write(0x10, 0b10100000); // accelerometer enabled, +-2g
+					// Enable accelerometer just before start measuring
 					iis_write(0x10, 0b10101000); // accelerometer enabled, +-4g
-					//	iis_write(0x10, 0b10101100); // accelerometer enabled, +-8g
-					//	iis_write(0x10, 0b10100100); // accelerometer enabled, +-16g
 
 					HAL_Delay(10); // necessary before start data reading...
 
@@ -310,12 +316,17 @@ int main(void)
 					iis_write(0x0A, 0b01000000); // to clear FIFO just before start data recording
 					iis_write(0x0A, 0b01000110); // to start FIFO as continuous mode
 
-					//This is to get the accel ODR
+					decim_counter = 0;
+					accumulated_samples = 0;
+					last_saved_ts = 0;
+
+//This is to get the accel ODR
 					iis_read(0x63, 1, (uint8_t*) &freq_fine);
 					ODR = 26667 * (1 + (0.0015 * freq_fine)); // to get the "real" ODR
 
-					sprintf(buffer, "%.2f 0 0 0 \n", ODR);
-					f_puts(buffer, &myFile);
+					// Do NOT write the ODR line (was causing the corrupt first timestamp)
+					// sprintf(buffer, "%.2f 0 0 0 \n", ODR);
+					// f_puts(buffer, &myFile);
 					clear_buffer();
 
 				} else {
@@ -347,30 +358,17 @@ int main(void)
 
 			clear_buffer();
 			millis = HAL_GetTick();
-			//				sprintf (buffer, " \n Terminamos de adquirir datos, tiempo: ");
-			//				f_puts(buffer, &myFile);
-			//				clear_buffer();
 			millis = HAL_GetTick();
 			sprintf(buffer, "Archivo cerrado en el tiempo: %iB", (int) millis);
 
 			send_uart2(buffer);
 			send_uart2("\n");
-			//to do not write in file, just in terminal
-			//				f_puts(buffer, &myFile);
-			//				clear_buffer();
-			//				sprintf (buffer, "\n");
-			//				f_puts(buffer, &myFile);
 			clear_buffer();
 
 			f_close(&myFile);
 
-			//disable accelerometer after finish data recording
-
-			//	iis_write(0x10, 0b10100000); // accelerometer disabled, +-2g
+			// Disable accelerometer after finish data recording
 			iis_write(0x10, 0b00001000); // accelerometer disabled, +-4g
-			//	iis_write(0x10, 0b10101100); // accelerometer disabled, +-8g
-			//	iis_write(0x10, 0b10100100); // accelerometer disabled, +-16g
-
 			iis_write(0x0A, 0b01000000); // to clear FIFO
 
 			/* Unmount SDCARD */
@@ -388,27 +386,18 @@ int main(void)
 		if (flag_recordData) {
 			uint32_t aux = 0;
 
-			iis_FIFO_read(datax, datay, dataz, time); // to read data from the FIFO
+			iis_FIFO_read(datax, datay, dataz, time);
 
-//			iis_normal_read(time, datax, datay, dataz);
-
-			// NORMAL Data writing from FIFO, WTM > 2
 			for (uint16_t i = 0; i < WTM_THRESHOLD / 2; i++) {
-				sprintf(buffer, "%lu %d %d %d \n", time[i], datax[i], datay[i],
-						dataz[i]);
-				send_uart2(buffer);
+				if (time[i] == 0) continue; // slot vacío
+				// Solo guardar si han pasado >= 80 LSB (80 x 12.5us = 1ms) desde la última guardada
+				if (last_saved_ts != 0 && time[i] < last_saved_ts + TS_THRESHOLD) continue;
+				last_saved_ts = time[i];
+				float ts_ms = (float)time[i] * 12.5f / 1000.0f;
+				sprintf(buffer, "%.3f %d %d %d\n", ts_ms, datax[i], datay[i], dataz[i]);
 				f_write(&myFile, buffer, strlen(buffer), (UINT*) &aux);
 				clear_buffer();
 			}
-			// NORMAL Data writing from FIFO, WTM = 2
-//			sprintf (buffer, "%d %d %d %d \n",time[0],datax[0],datay[0],dataz[0]);
-//			f_puts(buffer, &myFile);
-//			clear_buffer();
-
-			// Data Package writing
-//			dataBuffering(datax, datay, dataz, time, buffer,bufferData); // to Buffer the data into a char array
-//			f_write(&myFile, bufferData, strlen(bufferData), &aux);// Write the buffer into the SD card
-//			clear_string(bufferData);
 
 			if (time_counter_done) { // to secure recorded data each 30min
 				time_counter_done = RESET;
@@ -566,17 +555,9 @@ void iis_init(void) // look for the registers who are being modified
 	iis_write(0x19, 0b00100000); // control register 10 timestamp counter enable
 	iis_write(0x0A, 0b00000000); // FIFO control register 4 - FIFO Clear and Reset
 	iis_write(0x07, (uint8_t) auxVal);
-	iis_write(0x08, (uint8_t) auxMask); // FIFO control register 1 and 2 - Set Watermark Threshold at 448 FIFO words (7 bytes word)
+	iis_write(0x08, (uint8_t) auxMask); // FIFO control register 1 and 2 - Set Watermark Threshold
 	iis_write(0x09, 0b00001010); // FIFO control register 3 - Sets and enables write freq in FIFO at 26667Hz
-	iis_write(0x0A, 0b01000110); // FIFO control register 4 - 01 to write timestamp at 26667Hz, 00 to desable temp writing, 0 by default, 110 for FIFO continuous mode
-
-	//iis_write(0x10, data_rec[0] | 0xA0 );  // enable accelerometer
-	//iis_write(0x10, data_rec[0] | 0xA0 );  // enable accelerometer
-
-	//adxl_write (0x31, 0x00);  // data_format range= +- 2g
-	//adxl_write (0x2d, 0x00);  // reset all bits
-	//adxl_write (0x2d, 0x08);  // power_cntl measure and wake up 8hz
-	//adxl_write(0x2c,0xF);     // output data rate 3200 Hz
+	iis_write(0x0A, 0b01000110); // FIFO control register 4 - continuous mode
 }
 
 void iis_normal_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
@@ -584,7 +565,6 @@ void iis_normal_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 	while (!(flag_dataAvailable & 0b00000001)) {
 		iis_read(0x1E, 1, &flag_dataAvailable);
 	}
-	//Recording...
 	iis_read(0x78, 6, data_rec);
 	iis_read(0x40, 4, data_rec2);
 
@@ -594,77 +574,70 @@ void iis_normal_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 
 	time[0] = (data_rec2[3] << 8 * 3) | (data_rec2[2] << 8 * 2)
 			| (data_rec2[1] << 8) | (data_rec2[0] << 0);
-
 }
 
+/**
+ * @brief  Read FIFO and store all complete accel+timestamp pairs in order.
+ */
 void iis_FIFO_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 		uint32_t *ptrTimestamp) {
-	int evenData = 0;
+
 	while (!(flag_FIFO_dataAvailable >> 7)) {
 		iis_read(0x3B, 1, &flag_FIFO_dataAvailable);
-	} // To wait until a new set of data is available
+	}
 	flag_FIFO_dataAvailable = RESET;
-	//Recording...
-	iis_read(0x78, WTM_THRESHOLD * 7, dataFIFO); // Data and time acquisition 224 accel data words and 224 timestamp words
 
-	for (uint16_t i = 0; i < WTM_THRESHOLD; i++) {
+	iis_read(0x78, WTM_THRESHOLD * 7, dataFIFO);
 
-		switch (dataFIFO[i * 7] >> 3) { // To know whether is acceleration or timestamp data (TAG_SENSOR)
+	int16_t  temp_x = 0, temp_y = 0, temp_z = 0;
+	uint32_t temp_ts = 0;
+	uint8_t  has_accel = 0, has_ts = 0;
+	uint16_t out_idx = 0;
 
-		case TAG_SENSOR_ACCEL: // acceleration data
-			*ptrDataX = (dataFIFO[i * 7 + 2] << 8) | dataFIFO[i * 7 + 1];
-			*ptrDataY = (dataFIFO[i * 7 + 4] << 8) | dataFIFO[i * 7 + 3];
-			*ptrDataZ = (dataFIFO[i * 7 + 6] << 8) | dataFIFO[i * 7 + 5];
-			ptrDataX++;
-			ptrDataY++;
-			ptrDataZ++;
-			evenData++;
-			break;
-
-		case TAG_SENSOR_TIMESTAMP: // time data
-			*ptrTimestamp = (dataFIFO[i * 7 + 4] << 8 * 3)
-					| (dataFIFO[i * 7 + 3] << 8 * 2)
-					| (dataFIFO[i * 7 + 2] << 8) | (dataFIFO[i * 7 + 1] << 0);
-			ptrTimestamp++;
-			evenData--;
-			break;
-
-		}
+	// Zero output arrays
+	for (uint16_t j = 0; j < (uint16_t)(WTM_THRESHOLD / 2); j++) {
+		ptrDataX[j] = 0;
+		ptrDataY[j] = 0;
+		ptrDataZ[j] = 0;
+		ptrTimestamp[j] = 0;
 	}
 
+	for (uint16_t i = 0; i < WTM_THRESHOLD; i++) {
+		uint8_t tag = dataFIFO[i * 7] >> 3;
+
+		if (tag == TAG_SENSOR_ACCEL) {
+			temp_x = (int16_t)((dataFIFO[i*7+2] << 8) | dataFIFO[i*7+1]);
+			temp_y = (int16_t)((dataFIFO[i*7+4] << 8) | dataFIFO[i*7+3]);
+			temp_z = (int16_t)((dataFIFO[i*7+6] << 8) | dataFIFO[i*7+5]);
+			has_accel = 1;
+		}
+		else if (tag == TAG_SENSOR_TIMESTAMP) {
+			temp_ts = ((uint32_t)dataFIFO[i*7+4] << 24)
+					| ((uint32_t)dataFIFO[i*7+3] << 16)
+					| ((uint32_t)dataFIFO[i*7+2] << 8)
+					|  (uint32_t)dataFIFO[i*7+1];
+			has_ts = 1;
+		}
+
+		if (has_accel && has_ts && out_idx < (uint16_t)(WTM_THRESHOLD / 2)) {
+			ptrDataX[out_idx] = temp_x;
+			ptrDataY[out_idx] = temp_y;
+			ptrDataZ[out_idx] = temp_z;
+			ptrTimestamp[out_idx] = temp_ts;
+			out_idx++;
+			has_accel = 0;
+			has_ts = 0;
+		}
+	}
 }
 
 void dataBuffering(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
-        uint32_t *ptrTimestamp, char *ptrBuffer, char *ptrStrData) {
-    // After read and reconstruct data, buffer all the data to write it into SD card.
-    // Note: ptrTimestamp is in "ticks" (12.5 us per LSB). We convert to real microseconds here.
-    // Also: we decimate the logged samples to TARGET_LOG_HZ (effective rate in the TXT).
-    static uint32_t sample_idx = 0;
-    const uint32_t n = (DECIM_N < 1U) ? 1U : DECIM_N;
-
-    for (uint16_t i = 0; i < WTM_THRESHOLD / 2; i++) {
-
-        // Always advance the global sample index, even if we don't log this sample.
-        uint32_t idx = sample_idx++;
-        if ((idx % n) != 0U) {
-            ptrDataX++;
-            ptrDataY++;
-            ptrDataZ++;
-            ptrTimestamp++;
-            continue;
-        }
-
-        // Convert timestamp ticks -> real microseconds.
-        // 12.5 us/LSB = 125 tenths of us per tick.
-        uint64_t t_us_x10 = (uint64_t)(*ptrTimestamp) * 125ULL;
-        unsigned long long t_us = (unsigned long long)(t_us_x10 / 10ULL);
-        unsigned long long t_us_frac = (unsigned long long)(t_us_x10 % 10ULL);
-
-        sprintf(ptrBuffer, "%llu.%1llu %d %d %d \n",
-                t_us, t_us_frac, *ptrDataX, *ptrDataY, *ptrDataZ);
-        strcat(ptrStrData, ptrBuffer);
-        clear_buffer();
-
+		uint32_t *ptrTimestamp, char *ptrBuffer, char *ptrStrData) {
+	for (uint16_t i = 0; i < WTM_THRESHOLD / 2; i++) {
+		float ts_ms = (float)(*ptrTimestamp) * 12.5f / 1000.0f;
+		sprintf(ptrBuffer, "%.3f %d %d %d \n", ts_ms, *ptrDataX, *ptrDataY, *ptrDataZ);
+		strcat(ptrStrData, ptrBuffer);
+		clear_buffer();
 		ptrDataX++;
 		ptrDataY++;
 		ptrDataZ++;
@@ -672,82 +645,18 @@ void dataBuffering(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 	}
 }
 
-
 void clear_string(char *string) {
-
 	for (int i = 0; i < sizeof(string); i++) {
 		string[i] = '\0';
 	}
 }
 
-//void GPS_init(void)
-//{
-//	sendGpsMsg(msgSet5hz, 14);
-//	HAL_Delay(100);
-//	sendGpsMsg(msgDisableGGA, 16);
-//	HAL_Delay(100);
-//	sendGpsMsg(msgDisableGLL, 16);
-//	HAL_Delay(100);
-//	sendGpsMsg(msgDisableGSA, 16);
-//	HAL_Delay(100);
-//	sendGpsMsg(msgDisableGSV, 16);
-//	HAL_Delay(100);
-//	sendGpsMsg(msgDisableVTG, 16);
-//}
-//
-//void GPS_init2(void)
-//{
-//	send_uart6(msgSet5hz);
-//	send_uart6(msgDisableGGA);
-//	send_uart6(msgDisableGLL);
-//	send_uart6(msgDisableGSA);
-//	send_uart6(msgDisableGSV);
-//	send_uart6(msgDisableVTG);
-//
-//	send_uart2(msgSet5hz);
-//	send_uart2(msgDisableGGA);
-//	send_uart2(msgDisableGLL);
-//	send_uart2(msgDisableGSA);
-//	send_uart2(msgDisableGSV);
-//	send_uart2(msgDisableVTG);
-//}
-//
-//
-//
-//void sendGpsMsg(char *msg, uint8_t length)
-//{
-//	for( ii = 0; ii < length; ii ++){
-//		if(*(msg+ii) != 0x00)
-//		{
-//			send_uart (*(msg+ii));
-//		}
-//		else
-//		{
-//			while(!(USART2->SR&0x0080))
-//			{
-//
-//			}
-//			USART2->DR=(0);
-//
-//			while(!(USART6->SR&0x0080))
-//			{
-//
-//			}
-//			USART6->DR=(0);
-//		}
-//
-//		//writeChar(&handlerUsartGPS,*(msg+i));
-//	}
-//}
-
-//uart1
 void send_uart2(char *string) {
 	if (!devMode) {
 		return;
 	}
-
 	uint16_t len = strlen(string);
-	HAL_UART_Transmit(&huart2, (uint8_t*) string, len, HAL_MAX_DELAY); // transmit in blocking mode
+	HAL_UART_Transmit(&huart2, (uint8_t*) string, len, HAL_MAX_DELAY);
 }
 
 /* USER CODE END 4 */
@@ -759,7 +668,6 @@ void send_uart2(char *string) {
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-	/* User can add his own implementation to report the HAL error return state */
 	__disable_irq();
 	while (1) {
 	}
@@ -776,8 +684,6 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-	/* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
