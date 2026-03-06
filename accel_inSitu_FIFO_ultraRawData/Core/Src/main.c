@@ -432,6 +432,7 @@ int main(void)
 			char line[LOG_LINE_MAX];
 			float ts_ms = (float)time[i] * 12.5f / 1000.0f;
 			int line_len = snprintf(line, sizeof(line), "%.3f %d %d %d\n", ts_ms, datax[i], datay[i], dataz[i]);
+			dbg_uartf("%s", line);
 				if (line_len > 0 && (uint32_t)line_len < LOG_LINE_MAX) {
 					if ((active_log_len + (uint32_t)line_len) > LOG_CHUNK_SIZE) {
 						if (flush_pending == SET) {
@@ -473,7 +474,7 @@ int main(void)
 					flag_closeFile = SET;
 				} else {
 					bytes_since_sync = 0U;
-					dbg_uart("Periodic sync OK\n");
+					// dbg_uart("Periodic sync OK\n");
 				}
 			}
 		}
