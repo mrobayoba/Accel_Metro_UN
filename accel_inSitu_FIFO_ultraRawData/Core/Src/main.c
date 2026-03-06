@@ -424,48 +424,55 @@ int main(void)
 		if (flag_recordData) {
 			if (flag_fifo_irq) {
 				flag_fifo_irq = RESET;
-			dbg_uart("Reading FIFO\n");
-			iis_FIFO_read(datax, datay, dataz, time);
+				iis_FIFO_read(datax, datay, dataz, time);
 
-			for (uint16_t i = 0; i < WTM_THRESHOLD / 2; i++) {
-				char line[LOG_LINE_MAX];
-				float ts_ms = (float)time[i] * 12.5f / 1000.0f;
-				int line_len = snprintf(line, sizeof(line), "%.3f %d %d %d\n", ts_ms, datax[i], datay[i], dataz[i]);
-				dbg_uartf("%s", line);
+				for (uint16_t i = 0; i < WTM_THRESHOLD / 2; i++) {
+					char line[LOG_LINE_MAX];
+					float ts_ms = (float)time[i] * 12.5f / 1000.0f;
+					int line_len = snprintf(line, sizeof(line), "%.3f %d %d %d\n", ts_ms, datax[i], datay[i], dataz[i]);
+					dbg_uartf("%s", line);
 
-				if (line_len > 0 && (uint32_t)line_len < LOG_LINE_MAX) {
-					if ((active_log_len + (uint32_t)line_len) > LOG_CHUNK_SIZE) {
-						if (flush_pending == SET) {
-							dropped_lines++;
+					if (line_len > 0 && (uint32_t)line_len < LOG_LINE_MAX) {
+						if ((active_log_len + (uint32_t)line_len) > LOG_CHUNK_SIZE) {
+							if (flush_pending == SET) {
+								dropped_lines++;
+							} else {
+								char *tmp = flush_log_buf;
+								flush_log_buf = active_log_buf;
+								flush_log_len = active_log_len;
+								active_log_buf = tmp;
+								active_log_len = 0U;
+								flush_pending = SET;
+							}
+						}
+
+						if ((active_log_len + (uint32_t)line_len) <= LOG_CHUNK_SIZE) {
+							memcpy(&active_log_buf[active_log_len], line, (size_t)line_len);
+							active_log_len += (uint32_t)line_len;
 						} else {
-							char *tmp = flush_log_buf;
-							flush_log_buf = active_log_buf;
-							flush_log_len = active_log_len;
-							active_log_buf = tmp;
-							active_log_len = 0U;
-							flush_pending = SET;
+							dropped_lines++;
 						}
 					}
+				}
 
-					if ((active_log_len + (uint32_t)line_len) <= LOG_CHUNK_SIZE) {
-						memcpy(&active_log_buf[active_log_len], line, (size_t)line_len);
-						active_log_len += (uint32_t)line_len;
-					} else {
-						dropped_lines++;
-					}
+				// If FIFO is still above watermark, emulate a pending IRQ to keep draining.
+				// This prevents INT1 from remaining high and missing subsequent rising edges.
+				uint8_t fifo_st = 0U;
+				iis_read(0x3B, 1, &fifo_st);
+				if (fifo_st >> 7) {
+					flag_fifo_irq = SET;
 				}
 			}
-		}
 
-		if (flush_pending == SET) {
-			if (flush_pending_buffers() != FR_OK) {
-				flag_recordData = RESET;
-				flag_toggleRecord = RESET;
-				flag_closeFile = SET;
+			if (flush_pending == SET) {
+				if (flush_pending_buffers() != FR_OK) {
+					flag_recordData = RESET;
+					flag_toggleRecord = RESET;
+					flag_closeFile = SET;
+				}
 			}
-		}
 
-		if (bytes_since_sync >= SYNC_BYTES_THRESHOLD || time_counter_done) {
+			if (bytes_since_sync >= SYNC_BYTES_THRESHOLD || time_counter_done) {
 				time_counter_done = RESET;
 				if (f_sync(&myFile) != FR_OK) {
 					HAL_GPIO_WritePin(ERROR_LED_PORT, ERROR_LED_PIN, TRUE);
@@ -548,7 +555,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	}
 	if (GPIO_Pin == GPIO_PIN_9) { // Accel FIFO watermark IRQ
 		flag_fifo_irq = SET;
-		dbg_uart("IRQ!\n");
 	}
 }
 
