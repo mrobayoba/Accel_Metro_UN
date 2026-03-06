@@ -426,13 +426,13 @@ int main(void)
 				flag_fifo_irq = RESET;
 			dbg_uart("Reading FIFO\n");
 			iis_FIFO_read(datax, datay, dataz, time);
-		}
 
-		for (uint16_t i = 0; i < WTM_THRESHOLD / 2; i++) {				
-			char line[LOG_LINE_MAX];
-			float ts_ms = (float)time[i] * 12.5f / 1000.0f;
-			int line_len = snprintf(line, sizeof(line), "%.3f %d %d %d\n", ts_ms, datax[i], datay[i], dataz[i]);
-			dbg_uartf("%s", line);
+			for (uint16_t i = 0; i < WTM_THRESHOLD / 2; i++) {
+				char line[LOG_LINE_MAX];
+				float ts_ms = (float)time[i] * 12.5f / 1000.0f;
+				int line_len = snprintf(line, sizeof(line), "%.3f %d %d %d\n", ts_ms, datax[i], datay[i], dataz[i]);
+				dbg_uartf("%s", line);
+
 				if (line_len > 0 && (uint32_t)line_len < LOG_LINE_MAX) {
 					if ((active_log_len + (uint32_t)line_len) > LOG_CHUNK_SIZE) {
 						if (flush_pending == SET) {
@@ -455,10 +455,7 @@ int main(void)
 					}
 				}
 			}
-
-			if (flush_pending == SET) {
-				if (flush_pending_buffers() != FR_OK) {
-					flag_recordData = RESET;
+		}
 					flag_toggleRecord = RESET;
 					flag_closeFile = SET;
 				}
