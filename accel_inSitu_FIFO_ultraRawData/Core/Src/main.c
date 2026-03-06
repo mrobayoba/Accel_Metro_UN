@@ -456,12 +456,16 @@ int main(void)
 				}
 			}
 		}
-					flag_toggleRecord = RESET;
-					flag_closeFile = SET;
-				}
-			}
 
-			if (bytes_since_sync >= SYNC_BYTES_THRESHOLD || time_counter_done) {
+		if (flush_pending == SET) {
+			if (flush_pending_buffers() != FR_OK) {
+				flag_recordData = RESET;
+				flag_toggleRecord = RESET;
+				flag_closeFile = SET;
+			}
+		}
+
+		if (bytes_since_sync >= SYNC_BYTES_THRESHOLD || time_counter_done) {
 				time_counter_done = RESET;
 				if (f_sync(&myFile) != FR_OK) {
 					HAL_GPIO_WritePin(ERROR_LED_PORT, ERROR_LED_PIN, TRUE);
