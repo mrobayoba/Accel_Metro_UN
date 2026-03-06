@@ -206,7 +206,7 @@ void iis_init(void);
 /* NOT DEFINED YET*/
 void iis_normal_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 		uint32_t *ptrTimestamp);
-void iis_FIFO_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
+uint16_t iis_FIFO_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 		uint32_t *ptrTimestamp);
 
 void dataBuffering(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
@@ -310,19 +310,19 @@ int main(void)
 
 					if (firstTimeOpen) {
 						firstTimeOpen = FALSE;
-						f_puts("IIS3DWB 3-axis accelerometer by STM32\n",
+						f_puts("IIS3DWB 3-axis accelerometer by STM32\r\n",
 								&myFile);
 						sprintf(buffer,
-								"Configuration: FIFO continuous mode WTM = %d Sensibility = +-4g\n",
+								"Configuration: FIFO continuous mode WTM = %d Sensibility = +-4g\r\n",
 								(uint16_t) WTM_THRESHOLD);
 						f_puts(buffer, &myFile);
 						clear_buffer();
-						f_puts("Timestamp resolution = 12.5us/LSB converted to ms, accel resolution 0.122mg/LSB\n", &myFile);
-						sprintf(buffer, "Target sampling period = %.4f ms (%.1f Hz)\n\n",
+						f_puts("Timestamp resolution = 12.5us/LSB converted to ms, accel resolution 0.122mg/LSB\r\n", &myFile);
+						sprintf(buffer, "Target sampling period = %.4f ms (%.1f Hz)\r\n\r\n",
 								(float)TARGET_PERIOD_MS, 1000.0f / TARGET_PERIOD_MS);
 						f_puts(buffer, &myFile);
 						clear_buffer();
-						f_puts("Timestamp(ms) accelX(mg) accelY(mg) accelZ(mg)\n", &myFile);
+						f_puts("Timestamp(ms) accelX(mg) accelY(mg) accelZ(mg)\r\n", &myFile);
 					}
 
 					sprintf(buffer,
@@ -424,12 +424,12 @@ int main(void)
 		if (flag_recordData) {
 			if (flag_fifo_irq) {
 				flag_fifo_irq = RESET;
-				iis_FIFO_read(datax, datay, dataz, time);
+				uint16_t valid_count = iis_FIFO_read(datax, datay, dataz, time);
 
-				for (uint16_t i = 0; i < WTM_THRESHOLD / 2; i++) {
+				for (uint16_t i = 0; i < valid_count; i++) {
 					char line[LOG_LINE_MAX];
 					float ts_ms = (float)time[i] * 12.5f / 1000.0f;
-					int line_len = snprintf(line, sizeof(line), "%.3f %d %d %d\n", ts_ms, datax[i], datay[i], dataz[i]);
+					int line_len = snprintf(line, sizeof(line), "%.3f %d %d %d\r\n", ts_ms, datax[i], datay[i], dataz[i]);
 					dbg_uartf("%s", line);
 
 					if (line_len > 0 && (uint32_t)line_len < LOG_LINE_MAX) {
@@ -734,7 +734,7 @@ void iis_normal_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 /**
  * @brief  Read FIFO and store all complete accel+timestamp pairs in order.
  */
-void iis_FIFO_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
+uint16_t iis_FIFO_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 		uint32_t *ptrTimestamp) {
 
 	while (!(flag_FIFO_dataAvailable >> 7)) {
@@ -745,7 +745,7 @@ void iis_FIFO_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 	if (iis_read_fifo_dma(0x78, dataFIFO, WTM_THRESHOLD * 7) != HAL_OK) {
 		HAL_GPIO_WritePin(ERROR_LED_PORT, ERROR_LED_PIN, TRUE);
 		dbg_uart("SPI FIFO DMA read failed\n");
-		return;
+		return 0U;
 	}
 
 	int16_t  temp_x = 0, temp_y = 0, temp_z = 0;
@@ -788,13 +788,15 @@ void iis_FIFO_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 			has_ts = 0;
 		}
 	}
+
+	return out_idx;
 }
 
 void dataBuffering(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 		uint32_t *ptrTimestamp, char *ptrBuffer, char *ptrStrData) {
 	for (uint16_t i = 0; i < WTM_THRESHOLD / 2; i++) {
 		float ts_ms = (float)(*ptrTimestamp) * 12.5f / 1000.0f;
-		sprintf(ptrBuffer, "%.3f %d %d %d \n", ts_ms, *ptrDataX, *ptrDataY, *ptrDataZ);
+		sprintf(ptrBuffer, "%.3f %d %d %d \r\n", ts_ms, *ptrDataX, *ptrDataY, *ptrDataZ);
 		strcat(ptrStrData, ptrBuffer);
 		clear_buffer();
 		ptrDataX++;
