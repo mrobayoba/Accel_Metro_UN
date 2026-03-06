@@ -45,7 +45,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define UART_DEBUG_ENABLE 0   // Handcoded: set to 1 to enable UART logs, 0 to compile out debug logs
+#define UART_DEBUG_ENABLE 1   // Handcoded: set to 1 to enable UART logs, 0 to compile out debug logs
 
 #define BUFFER_SIZE 72
 #define DATA_BUFFERSIZE 20*7 // 7 bytes per word * 20 words
@@ -213,8 +213,6 @@ void dataBuffering(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
 		uint32_t *ptrTimestamp, char *ptrBuffer, char *ptrStrData);
 void clear_string(char *string);
 
-void send_uart2(char *string);
-
 /* USER CODE END 0 */
 
 /**
@@ -254,14 +252,14 @@ int main(void)
   MX_SPI1_Init();
   MX_TIM5_Init();
   /* USER CODE BEGIN 2 */
-	send_uart2("Starting Accel Metro-UN\n");
+	dbg_uart("Starting Accel Metro-UN\n");
 	HAL_Delay(100);
 	iis_init();
 	HAL_Delay(15);
 
 	HAL_TIM_Base_Start_IT(&htim5); // Flush timer
 	HAL_TIM_Base_Start_IT(&htim11); // Blinky timer
-	send_uart2("Ready to roll!!!");
+	dbg_uart("Ready to roll!!!");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -276,26 +274,26 @@ int main(void)
 			if (error == FR_OK) { // To start data recording...
 				HAL_GPIO_WritePin(ERROR_LED_PORT, ERROR_LED_PIN, FALSE);
 				HAL_Delay(100);
-				send_uart2("SD CARD montada satisfactoriamiente\n");
+				dbg_uart("SD CARD montada satisfactoriamiente\n");
 				/*************** Card capacity details ********************/
 				/* Check free space */
 				f_getfree("", &fre_clust, &pfs);
 				clear_buffer();
 				total = (uint32_t) ((pfs->n_fatent - 2) * pfs->csize * 0.5);
 				sprintf(buffer, "SD CARD Total Size: \t%lu\n", total);
-				send_uart2(buffer);
+				dbg_uart(buffer);
 
 				clear_buffer();
 				free_space = (uint32_t) (fre_clust * pfs->csize * 0.5);
 				sprintf(buffer, "SD CARD Free Space: \t%lu\n\n", free_space);
-				send_uart2(buffer);
+				dbg_uart(buffer);
 				clear_buffer();
 
 				millis = HAL_GetTick();
 				sprintf(buffer, "%iA", (int) millis);
 
-				send_uart2(buffer);
-				send_uart2("\n");
+				dbg_uart(buffer);
+				dbg_uart("\n");
 				clear_buffer();
 
 				HAL_Delay(100);
@@ -308,7 +306,7 @@ int main(void)
 				if (error == FR_OK) {
 					HAL_GPIO_WritePin(RECORD_LED_PORT, RECORD_LED_PIN, TRUE);
 					HAL_GPIO_WritePin(ERROR_LED_PORT, ERROR_LED_PIN, FALSE);
-					send_uart2("Archivo abierto\n\n");
+					dbg_uart("Archivo abierto\n\n");
 
 					if (firstTimeOpen) {
 						firstTimeOpen = FALSE;
@@ -329,11 +327,11 @@ int main(void)
 
 					sprintf(buffer,
 							"Comenzamos a adquirir datos, tiempo (host): ");
-					send_uart2(buffer);
+					dbg_uart(buffer);
 					clear_buffer();
 					millis = HAL_GetTick();
 					sprintf(buffer, "%iA\n", (int) millis);
-					send_uart2(buffer);
+					dbg_uart(buffer);
 					clear_buffer();
 
 					// Enable accelerometer just before start measuring
@@ -363,7 +361,7 @@ int main(void)
 
 				} else {
 					HAL_GPIO_WritePin(ERROR_LED_PORT, ERROR_LED_PIN, TRUE);
-					send_uart2(
+					dbg_uart(
 							"El archivo no pudo ser abierto, presiona el boton reset...\n\n");
 				}
 
@@ -375,9 +373,9 @@ int main(void)
 			} else {
 				HAL_GPIO_WritePin(ERROR_LED_PORT, ERROR_LED_PIN, TRUE);
 				clear_buffer();
-				send_uart2("ERROR!!! in mounting SD CARD...\n");
+				dbg_uart("ERROR!!! in mounting SD CARD...\n");
 				sprintf(buffer, "Numero de error: %i \n\n", error);
-				send_uart2(buffer);
+				dbg_uart(buffer);
 
 			}
 		} else if (~flag_toggleRecord & flag_closeFile) { // To stop data recording...
@@ -393,8 +391,8 @@ int main(void)
 			millis = HAL_GetTick();
 			sprintf(buffer, "Archivo cerrado en el tiempo: %iB", (int) millis);
 
-			send_uart2(buffer);
-			send_uart2("\n");
+			dbg_uart(buffer);
+			dbg_uart("\n");
 			clear_buffer();
 
 			// Flush remaining data before closing
@@ -415,7 +413,7 @@ int main(void)
 			FRESULT error = f_mount(NULL, "/", 1);
 			HAL_Delay(100);
 			if (error == FR_OK)
-				send_uart2("SD CARD UNMOUNTED successfully...\n");
+				dbg_uart("SD CARD UNMOUNTED successfully...\n");
 
 			HAL_Delay(10);
 
@@ -426,15 +424,9 @@ int main(void)
 		if (flag_recordData) {
 			if (flag_fifo_irq) {
 				flag_fifo_irq = RESET;
-				iis_FIFO_read(datax, datay, dataz, time);
-			}
+			dbg_uart("Reading FIFO\n");
 
-			for (uint16_t i = 0; i < WTM_THRESHOLD / 2; i++) {
-				if (time[i] == 0) continue; // slot vacío
-				// Solo guardar si han pasado >= 80 LSB (80 x 12.5us = 1ms) desde la última guardada
-				if (last_saved_ts != 0 && time[i] < last_saved_ts + TS_THRESHOLD) continue;
-				last_saved_ts = time[i];
-				
+			for (uint16_t i = 0; i < WTM_THRESHOLD / 2; i++) {				
 				char line[LOG_LINE_MAX];
 				float ts_ms = (float)time[i] * 12.5f / 1000.0f;
 				int line_len = snprintf(line, sizeof(line), "%.3f %d %d %d\n", ts_ms, datax[i], datay[i], dataz[i]);
@@ -553,6 +545,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 	}
 	if (GPIO_Pin == GPIO_PIN_9) { // Accel FIFO watermark IRQ
 		flag_fifo_irq = SET;
+		dbg_uart("IRQ!\n");
 	}
 }
 
@@ -686,11 +679,11 @@ void iis_init(void) // look for the registers who are being modified
 	clear_buffer();
 
 	sprintf(buffer, "IIS accel ID: ");
-	send_uart2(buffer);
+	dbg_uart(buffer);
 	clear_buffer();
 	sprintf(buffer, "%i\n", x2);
-	send_uart2(buffer);
-	send_uart2("Configuring accel...\n");
+	dbg_uart(buffer);
+	dbg_uart("Configuring accel...\n");
 	iis_read(0x10, 1, data_rec);
 
 	iis_write(0x10, 0b00000000); // clear accel control register 1
@@ -702,6 +695,15 @@ void iis_init(void) // look for the registers who are being modified
 	iis_write(0x08, (uint8_t) auxMask); // FIFO control register 1 and 2 - Set Watermark Threshold
 	iis_write(0x09, 0b00001010); // FIFO control register 3 - Sets and enables write freq in FIFO at 26667Hz
 	iis_write(0x0A, 0b01000110); // FIFO control register 4 - continuous mode
+
+	// Configure interrupt pin characteristics (CTRL3_C = 0x12)
+	// H_LACTIVE=0 (active high), PP_OD=0 (push-pull)
+	iis_write(0x12, 0b01000100);
+
+	// Route FIFO watermark interrupt to INT1 pin (INT1_CTRL = 0x0D)
+	iis_write(0x0D, 0b00001000); // bit 3: FIFO_TH enable
+
+	dbg_uart("Interrupt routing configured\n");
 }
 
 void iis_normal_read(int16_t *ptrDataX, int16_t *ptrDataY, int16_t *ptrDataZ,
@@ -797,14 +799,6 @@ void clear_string(char *string) {
 	for (int i = 0; i < sizeof(string); i++) {
 		string[i] = '\0';
 	}
-}
-
-void send_uart2(char *string) {
-	if (!devMode) {
-		return;
-	}
-	uint16_t len = strlen(string);
-	HAL_UART_Transmit(&huart2, (uint8_t*) string, len, HAL_MAX_DELAY);
 }
 
 // SPI DMA callbacks for FIFO burst read
