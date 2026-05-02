@@ -490,7 +490,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
         }
     }
     if (GPIO_Pin == GPIO_PIN_9) {
-        iis_FIFO_read(datax, datay, dataz, time); /* Lectura en ISR (original) */
+        // TODO: Si se desea usar interrupciones solo de debe usar una bandera aquí 
+        // para habilitar la lectura en el main loop.
     }
 }
 
